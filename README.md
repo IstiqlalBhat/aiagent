@@ -1,33 +1,37 @@
-# 🤖 Agentic AI - Voice Agent with Telegram Control
+# 🤖 Agentic AI - Voice Agent with ClawdBot Integration
 
-An AI-powered phone call agent that speaks naturally using **Gemini Live API**, connects via **Twilio**, and sends real-time transcripts with intent analysis to **Telegram**.
+An AI-powered phone call agent that speaks naturally using **OpenAI Realtime API** (with built-in Whisper for accurate transcription), connects via **Twilio**, and integrates with **ClawdBot** for executing commands through the **OpenClaw Gateway**.
 
 ## ✨ Features
 
-- 📞 **Real-time voice calls** - Natural conversations powered by Gemini's native audio
-- 🧠 **Intent understanding** - Gemini 3 Flash analyzes what the user wants
-- 💬 **Telegram integration** - Live transcripts and command extraction sent to your bot
-- 🔄 **Memory** - Conversation context preserved throughout the call
-- 🎯 **Command extraction** - Identifies actionable requests (send message, make call, etc.)
+- 📞 **Real-time voice calls** - Natural conversations powered by OpenAI Realtime API
+- 🎯 **Accurate transcription** - Built-in Whisper STT handles proper nouns correctly
+- 📲 **Incoming calls** - Receive calls on your Twilio number, AI answers automatically
+- 🧠 **Intent understanding** - Analyzes what the user wants and routes to ClawdBot
+- 🤖 **ClawdBot integration** - Execute commands via OpenClaw Gateway (send messages, check emails, play music, etc.)
+- 🔄 **Bidirectional communication** - ClawdBot responses are spoken back to the caller
+- 💬 **Telegram integration** - Live transcripts and command extraction
+- 🖥️ **Background service** - Runs as a daemon, auto-starts on boot
+- 🌐 **Tunnel support** - Built-in Cloudflare/ngrok tunnel for webhook URL
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────┐     ┌──────────────────────────────────┐     ┌─────────────┐
-│   Phone     │────▶│         AGENTIC AI SERVER        │────▶│  Telegram   │
-│   (User)    │◀────│                                  │     │    Bot      │
-└─────────────┘     │  ┌─────────┐    ┌─────────────┐  │     └─────────────┘
-                    │  │ Twilio  │◀──▶│   Gemini    │  │
-┌─────────────┐     │  │ Handler │    │ Live Audio  │  │
-│   Twilio    │◀───▶│  └────┬────┘    └──────┬──────┘  │
-│   Cloud     │     │       │    Audio       │        │
-└─────────────┘     │       └────Bridge──────┘        │
-                    │              │                   │
-                    │       ┌──────▼──────┐           │
-                    │       │ Conversation │           │
-                    │       │    Brain     │───────────┼──▶ Telegram
-                    │       │ (Gemini 3)   │           │
-                    │       └─────────────┘           │
+┌─────────────┐     ┌──────────────────────────────────┐     ┌─────────────────┐
+│   Phone     │────▶│         AGENTIC AI SERVER        │────▶│   ClawdBot      │
+│   (User)    │◀────│                                  │◀────│   Gateway       │
+└─────────────┘     │  ┌─────────┐    ┌─────────────┐  │     └─────────────────┘
+                    │  │ Twilio  │◀──▶│   OpenAI    │  │           │
+┌─────────────┐     │  │ Handler │    │  Realtime   │  │     ┌─────▼─────┐
+│   Twilio    │◀───▶│  └────┬────┘    └──────┬──────┘  │     │ Skills:   │
+│   Cloud     │     │       │    Audio       │         │     │ - YouTube │
+└─────────────┘     │       └────Bridge──────┘         │     │ - Spotify │
+                    │              │                   │     │ - Email   │
+                    │       ┌──────▼──────┐            │     │ - etc.    │
+                    │       │ Conversation │────────────┼────▶└───────────┘
+                    │       │    Brain     │            │
+                    │       │  (Intent)    │            │
+                    │       └─────────────┘            │
                     └──────────────────────────────────┘
 ```
 
@@ -50,12 +54,13 @@ pip install -e .
 
 ### Step 2: Get Your API Keys
 
-You'll need credentials from 4 services:
+You'll need credentials from these services:
 
 | Service | Get it from | What you need |
 |---------|-------------|---------------|
 | **Twilio** | [console.twilio.com](https://console.twilio.com/) | Account SID, Auth Token, Phone Number |
-| **Gemini** | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | API Key |
+| **OpenAI** | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) | API Key (for Realtime API + Whisper) |
+| **Gemini** | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | API Key (for intent analysis) |
 | **Telegram** | [@BotFather](https://t.me/BotFather) on Telegram | Bot Token |
 | **Telegram Chat ID** | See instructions below | Your Chat ID |
 
@@ -81,7 +86,10 @@ TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 TWILIO_AUTH_TOKEN=your_auth_token_here
 TWILIO_PHONE_NUMBER=+1XXXXXXXXXX
 
-# Gemini (from aistudio.google.com)
+# OpenAI (for Realtime API + Whisper STT)
+OPENAI_API_KEY=sk-proj-your_openai_api_key_here
+
+# Gemini (for intent analysis)
 GEMINI_API_KEY=your_gemini_api_key_here
 
 # Telegram (from @BotFather)
@@ -89,100 +97,125 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
 ```
 
-### Step 4: Expose Your Server (ngrok)
+### Step 4: Start a Tunnel (ngrok)
 
 Twilio needs to reach your local server. Use ngrok:
 
 ```bash
-# Install ngrok (if not already)
+# Install ngrok if needed
 brew install ngrok  # Mac
-# or download from ngrok.com
+# or download from https://ngrok.com/download
 
 # Start tunnel
-ngrok http 8080
+agenticai tunnel start
+# or directly: ngrok http 8080
 ```
 
-Copy the `https://xxxxx.ngrok.io` URL - you'll need it.
+Copy the public URL that appears (e.g., `https://xxxx.ngrok.io`).
 
-### Step 5: Start the Server
+### Step 5: Install as Background Service
+
+Run the agent as a daemon that auto-starts on boot:
 
 ```bash
-agenticai server
+# Install the service with your ngrok URL
+agenticai service install --webhook-url https://xxxx.ngrok.io
+
+# Start it
+agenticai service start
+
+# Check status
+agenticai service status
 ```
 
-You should see:
-```
-Starting server on 0.0.0.0:8080
-Webhook path: /twilio/voice
-WebSocket path: /twilio/media-stream
-INFO: Uvicorn running on http://0.0.0.0:8080
+The server now runs in the background! View logs with:
+```bash
+agenticai service logs -f
 ```
 
 ### Step 6: Make a Call!
 
-In a new terminal:
-
 ```bash
-agenticai trigger --to +1YOURNUMBER --webhook-url https://xxxxx.ngrok.io
+agenticai trigger --to +1YOURNUMBER --webhook-url https://xxxx.ngrok.io
 ```
 
-Your phone will ring, and you'll see transcripts in Telegram! 🎉
+Your phone will ring, and the AI will answer! 🎉
 
-## 📱 What You'll See in Telegram
+### Receive Incoming Calls
 
-```
-📞 Call started to +1234567890
+Configure your Twilio number to point to your webhook:
 
-👤 User: Can you send hi to my WhatsApp group chat?
-📌 Intent: send_message
-💬 Message: hi
-📍 To: WhatsApp group chat
+1. Go to [Twilio Console](https://console.twilio.com/) → Phone Numbers → Your Number
+2. Under "Voice & Fax", set:
+   - "A call comes in" → Webhook → `https://xxxx.ngrok.io/twilio/voice`
+3. Save
 
-🤖 Clawdy: I'll send that message now. What's the name of the group?
+Now when someone calls your Twilio number, the AI will answer!
 
-👤 User: It's called Family Chat
-📌 Intent: send_message
+## 🤖 ClawdBot Integration
 
-📋 Call Summary (45s)
-• send_message: hi → WhatsApp group chat
-📎 Extracted: names: Family Chat
-```
+This agent connects to [ClawdBot](https://github.com/AceDZN/clawdbot) via the OpenClaw Gateway for executing commands:
+
+### Supported Commands (via ClawdBot skills)
+
+| Command | Example |
+|---------|---------|
+| **YouTube** | "Open YouTube and search for Zayn Dusk Till Dawn" |
+| **Spotify** | "Play Shape of You on Spotify" |
+| **Email** | "Check my emails" |
+| **Messages** | "Send hi to John on WhatsApp" |
+| **Web Search** | "Search for nearby restaurants" |
+| **And more...** | Any ClawdBot skill |
+
+### How it Works
+
+1. **User speaks** → OpenAI Realtime transcribes with Whisper
+2. **Brain analyzes** → Determines if it's an actionable command
+3. **ClawdBot executes** → Runs the command via OpenClaw Gateway
+4. **Response spoken** → AI speaks the result back to the caller
 
 ## 🔧 Configuration
 
 ### config.yaml
 
-Customize the AI behavior:
-
 ```yaml
-gemini:
-  model: "models/gemini-2.5-flash-native-audio-latest"
-  voice: "Zephyr"  # Options: Zephyr, Puck, Charon, Kore, Fenrir, Aoede
-  system_instruction: |
-    You are Clawdy, an AI agent assistant.
-    You can send messages, make calls, search the web, and more.
-    Be helpful and proactive.
+# OpenAI Realtime API (primary voice)
+openai_realtime:
+  enabled: true
+  api_key: ${OPENAI_API_KEY}
+  model: "gpt-4o-realtime-preview-2024-12-17"
+  voice: "alloy"  # Options: alloy, echo, fable, onyx, nova, shimmer
 
+# Gemini (for intent analysis only)
+gemini:
+  api_key: ${GEMINI_API_KEY}
+  model: "models/gemini-2.5-flash-native-audio-latest"
+
+# Telegram integration
 telegram:
   enabled: true
   bot_token: ${TELEGRAM_BOT_TOKEN}
   chat_id: ${TELEGRAM_CHAT_ID}
+
+# OpenClaw Gateway (for ClawdBot)
+gateway:
+  url: "ws://127.0.0.1:18789"
 
 server:
   host: "0.0.0.0"
   port: 8080
 ```
 
-### Voice Options
+### Voice Options (OpenAI)
 
 | Voice | Description |
 |-------|-------------|
-| Zephyr | Warm, friendly |
-| Puck | Energetic, playful |
-| Charon | Deep, authoritative |
-| Kore | Soft, gentle |
-| Fenrir | Strong, bold |
-| Aoede | Musical, expressive |
+| alloy | Neutral, balanced |
+| echo | Warm, conversational |
+| fable | Expressive, storytelling |
+| onyx | Deep, authoritative |
+| nova | Friendly, upbeat |
+| shimmer | Soft, gentle |
 
 ## 📋 CLI Commands
 
@@ -202,24 +235,26 @@ agenticai --help
 
 ## 🧠 How the Brain Works
 
-The **ConversationBrain** (powered by Gemini 3 Flash) does:
+The **ConversationBrain** does:
 
-1. **Buffers transcripts** - Collects word-by-word audio into complete sentences
-2. **Analyzes intent** - Understands what the user wants
-3. **Extracts entities** - Pulls out names, numbers, dates, etc.
-4. **Sends to Telegram** - Clean, formatted messages (not word-by-word spam)
+1. **Receives transcripts** - From OpenAI Whisper (accurate proper nouns!)
+2. **Analyzes intent** - Determines if user wants to DO something
+3. **Routes to ClawdBot** - Sends actionable commands via OpenClaw Gateway
+4. **Handles responses** - Feeds ClawdBot responses back to OpenAI to speak
 
-### Supported Intents
+### Example Flow
 
-| Intent | Example |
-|--------|---------|
-| `send_message` | "Send hi to John on WhatsApp" |
-| `make_call` | "Call my mom" |
-| `search_web` | "Search for nearby restaurants" |
-| `set_reminder` | "Remind me to buy milk" |
-| `take_note` | "Take a note: meeting at 3pm" |
-| `get_info` | "What's the weather today?" |
-| `conversation` | General chat |
+```
+User: "Check my emails"
+  ↓
+Brain: Detects actionable intent (YES)
+  ↓
+ClawdBot: Executes gog skill for Gmail
+  ↓
+Response: "You have 3 unread emails: 1 from John about..."
+  ↓
+OpenAI: Speaks the response to the caller
+```
 
 ## 🔒 Security
 
@@ -237,10 +272,15 @@ The **ConversationBrain** (powered by Gemini 3 Flash) does:
 - ✅ Verify ngrok is running and URL is correct
 - ✅ Ensure your Twilio number is configured for voice
 
-### No audio / Gemini not speaking
-- ✅ Check GEMINI_API_KEY is valid
-- ✅ Verify the model name supports audio
+### No audio / AI not speaking
+- ✅ Check OPENAI_API_KEY is valid and has Realtime API access
+- ✅ Verify the model name is correct
 - ✅ Check server logs for WebSocket errors
+
+### ClawdBot not responding
+- ✅ Ensure OpenClaw Gateway is running on port 18789
+- ✅ Check ClawdBot agent is started: `clawdbot agent --session-id agent:main:main`
+- ✅ Verify the skill you're using is configured
 
 ### No Telegram messages
 - ✅ Verify TELEGRAM_BOT_TOKEN is correct
@@ -264,9 +304,12 @@ aiagent/
 │   │   ├── config.py           # Config loading
 │   │   ├── call_manager.py     # Call lifecycle
 │   │   ├── audio_bridge.py     # Audio routing
-│   │   └── conversation_brain.py  # Intent analysis
-│   ├── gemini/
-│   │   └── realtime_handler.py # Gemini Live API
+│   │   └── conversation_brain.py  # Intent analysis + ClawdBot
+│   ├── openai/
+│   │   └── realtime_handler.py # OpenAI Realtime API
+│   ├── audio/
+│   │   ├── converter.py        # Audio format conversion
+│   │   └── whisper_stt.py      # Whisper STT (optional)
 │   ├── twilio/
 │   │   ├── client.py           # REST API
 │   │   └── websocket.py        # Media Streams

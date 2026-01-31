@@ -70,6 +70,7 @@ class GeminiRealtimeHandler:
         self._is_running = False
         self._tasks = []
         self._user_spoke = False  # Track if user spoke since last Gemini response
+        self._use_external_stt = False  # When True, ignore input_transcription (using Whisper)
 
     def set_callbacks(
         self,
@@ -79,12 +80,19 @@ class GeminiRealtimeHandler:
         on_turn_complete: Callable[[], Awaitable[None]] | None = None,
         on_user_turn_complete: Callable[[], Awaitable[None]] | None = None,
     ):
-        """Set event callbacks."""
+        """Set event callbacks.
+
+        If on_user_transcript is None, input transcription will be ignored
+        (useful when using external STT like Whisper).
+        """
         self._on_audio = on_audio
         self._on_transcript = on_transcript
         self._on_user_transcript = on_user_transcript
         self._on_turn_complete = on_turn_complete
         self._on_user_turn_complete = on_user_turn_complete
+
+        # Track if we're using external STT (Whisper)
+        self._use_external_stt = on_user_transcript is None
 
     async def connect(self, initial_prompt: str | None = None):
         """Connect to Gemini Live API."""
@@ -98,7 +106,7 @@ class GeminiRealtimeHandler:
         self.session = await self._context_manager.__aenter__()
 
         self.audio_in_queue = asyncio.Queue()  # Audio FROM Gemini
-        self.audio_out_queue = asyncio.Queue(maxsize=5)  # Audio TO Gemini
+        self.audio_out_queue = asyncio.Queue()  # Audio TO Gemini - unbounded to prevent drops
 
         logger.info("Connected to Gemini realtime")
 
@@ -145,25 +153,55 @@ class GeminiRealtimeHandler:
         Args:
             audio_data: PCM audio bytes
         """
-        try:
-            await self.audio_out_queue.put({
-                "data": audio_data,
-                "mime_type": "audio/pcm"
-            })
-        except asyncio.QueueFull:
-            # Drop if queue full
-            pass
+        if not audio_data or len(audio_data) == 0:
+            return
+
+        await self.audio_out_queue.put({
+            "data": audio_data,
+            "mime_type": "audio/pcm"
+        })
+
+        # Log queue size periodically to detect backpressure
+        qsize = self.audio_out_queue.qsize()
+        if qsize > 20 and qsize % 10 == 0:
+            print(f"=== GEMINI: Audio queue building up: {qsize} chunks ===", flush=True)
 
     async def _send_to_gemini(self):
-        """Background task to send audio to Gemini."""
+        """Background task to send audio to Gemini with batching."""
+        chunks_sent = 0
         try:
             while self._is_running:
+                # Get first chunk (blocking)
                 msg = await self.audio_out_queue.get()
-                await self.session.send(input=msg)
+
+                # Batch multiple chunks if available (reduces API calls)
+                audio_buffer = msg["data"]
+                batch_count = 1
+
+                # Grab more chunks if available (non-blocking), up to 10
+                while batch_count < 10:
+                    try:
+                        extra = self.audio_out_queue.get_nowait()
+                        audio_buffer += extra["data"]
+                        batch_count += 1
+                    except asyncio.QueueEmpty:
+                        break
+
+                # Send batched audio
+                await self.session.send(input={
+                    "data": audio_buffer,
+                    "mime_type": "audio/pcm"
+                })
+
+                chunks_sent += batch_count
+                if chunks_sent % 100 == 0:
+                    print(f"=== GEMINI: Sent {chunks_sent} audio chunks ===", flush=True)
+
         except asyncio.CancelledError:
-            pass
+            print(f"=== GEMINI: Send task cancelled after {chunks_sent} chunks ===", flush=True)
         except Exception as e:
             logger.error("Error sending to Gemini", error=str(e))
+            print(f"=== GEMINI SEND ERROR: {e} ===", flush=True)
 
     async def _receive_from_gemini(self):
         """Background task to receive audio and text from Gemini."""
@@ -194,7 +232,18 @@ class GeminiRealtimeHandler:
                     # Handle transcription from server_content (for native audio models)
                     if hasattr(response, 'server_content') and response.server_content:
                         sc = response.server_content
-                        # Check for output transcription (Gemini speaking)
+
+                        # IMPORTANT: Process input_transcription FIRST (user speech)
+                        # before checking output_transcription (which triggers user turn flush)
+                        if hasattr(sc, 'input_transcription') and sc.input_transcription:
+                            transcript_text = sc.input_transcription.text if hasattr(sc.input_transcription, 'text') else str(sc.input_transcription)
+                            if transcript_text:
+                                self._user_spoke = True  # Mark that user spoke
+                                print(f"=== USER TRANSCRIPT: {transcript_text[:100]}... ===", flush=True)
+                                if self._on_user_transcript:
+                                    await self._on_user_transcript(transcript_text)
+
+                        # Then check for output transcription (Gemini speaking)
                         if hasattr(sc, 'output_transcription') and sc.output_transcription:
                             transcript_text = sc.output_transcription.text if hasattr(sc.output_transcription, 'text') else str(sc.output_transcription)
                             if transcript_text:
@@ -203,18 +252,10 @@ class GeminiRealtimeHandler:
                                     print(f"=== USER TURN COMPLETE (Gemini responding) ===", flush=True)
                                     await self._on_user_turn_complete()
                                     self._user_spoke = False
-                                    
+
                                 print(f"=== GEMINI OUTPUT TRANSCRIPT: {transcript_text[:100]}... ===", flush=True)
                                 if self._on_transcript:
                                     await self._on_transcript(transcript_text, True)
-                        # Check for input transcription (what user said)
-                        if hasattr(sc, 'input_transcription') and sc.input_transcription:
-                            transcript_text = sc.input_transcription.text if hasattr(sc.input_transcription, 'text') else str(sc.input_transcription)
-                            if transcript_text:
-                                self._user_spoke = True  # Mark that user spoke
-                                print(f"=== USER TRANSCRIPT: {transcript_text[:100]}... ===", flush=True)
-                                if self._on_user_transcript:
-                                    await self._on_user_transcript(transcript_text)
 
                 # Gemini turn complete - flush assistant transcript
                 print(f"=== GEMINI: Turn complete (total audio chunks: {audio_chunk_count}) ===", flush=True)
@@ -234,3 +275,17 @@ class GeminiRealtimeHandler:
             Audio bytes (PCM 24kHz)
         """
         return await self.audio_in_queue.get()
+
+    async def send_text(self, text: str, end_of_turn: bool = True):
+        """Send text to Gemini to respond to.
+
+        This is used to inject ClawdBot responses for Gemini to speak.
+
+        Args:
+            text: Text for Gemini to respond to
+            end_of_turn: Whether this ends the turn (triggers response)
+        """
+        if self.session and text:
+            print(f"=== GEMINI: Injecting text: {text[:100]}... ===", flush=True)
+            await self.session.send(input=text, end_of_turn=end_of_turn)
+            print(f"=== GEMINI: Text injected, waiting for response ===", flush=True)

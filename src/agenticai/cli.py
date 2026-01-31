@@ -716,6 +716,443 @@ def test_connection(ctx):
     asyncio.run(run_tests())
 
 
+# ============================================================================
+# Service Management Commands
+# ============================================================================
+
+LAUNCHD_PLIST_NAME = "com.agenticai.server"
+LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_PLIST_NAME}.plist"
+LOG_DIR = Path("/tmp/agenticai")
+
+
+def get_plist_content(config_path: str, webhook_url: str) -> str:
+    """Generate launchd plist content."""
+    import shutil
+    
+    # Find the agenticai executable
+    agenticai_path = shutil.which("agenticai")
+    if not agenticai_path:
+        agenticai_path = sys.executable.replace("python", "agenticai")
+    
+    # Get the project directory
+    project_dir = Path(__file__).parent.parent.parent
+    
+    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHD_PLIST_NAME}</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>{agenticai_path}</string>
+        <string>server</string>
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>{project_dir}</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>AGENTICAI_WEBHOOK_URL</key>
+        <string>{webhook_url}</string>
+    </dict>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    
+    <key>StandardOutPath</key>
+    <string>{LOG_DIR}/agenticai.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>{LOG_DIR}/agenticai-error.log</string>
+    
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
+"""
+    return plist_content
+
+
+def is_service_running() -> bool:
+    """Check if the launchd service is running."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", LAUNCHD_PLIST_NAME],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def get_service_pid() -> Optional[int]:
+    """Get the PID of the running service."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", LAUNCHD_PLIST_NAME],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            # Parse output: "PID\tStatus\tLabel"
+            parts = result.stdout.strip().split("\t")
+            if parts and parts[0] != "-":
+                return int(parts[0])
+    except Exception:
+        pass
+    return None
+
+
+@cli.group()
+def service():
+    """Manage Agentic AI background service."""
+    pass
+
+
+@service.command("install")
+@click.option("--webhook-url", "-w", required=True, help="Permanent webhook URL (e.g., Cloudflare tunnel)")
+@click.pass_context
+def service_install(ctx, webhook_url):
+    """Install Agentic AI as a background service.
+    
+    This creates a launchd service that:
+    - Starts automatically on login
+    - Restarts on crash
+    - Logs to /tmp/agenticai/
+    
+    Example:
+        agenticai service install --webhook-url https://your-tunnel.trycloudflare.com
+    """
+    config_path = ctx.obj.get("config_path") or "config.yaml"
+    
+    console.print(Panel.fit(
+        "[bold]Installing Agentic AI Service[/bold]\n\n"
+        f"Webhook URL: [cyan]{webhook_url}[/cyan]\n"
+        f"Plist Path: [dim]{LAUNCHD_PLIST_PATH}[/dim]",
+        border_style="blue"
+    ))
+    
+    # Create log directory
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Check if already installed
+    if LAUNCHD_PLIST_PATH.exists():
+        if not Confirm.ask("[yellow]Service already installed. Reinstall?[/yellow]"):
+            console.print("[dim]Installation cancelled.[/dim]")
+            return
+        # Unload existing service
+        import subprocess
+        subprocess.run(["launchctl", "unload", str(LAUNCHD_PLIST_PATH)], capture_output=True)
+    
+    # Generate and write plist
+    plist_content = get_plist_content(config_path, webhook_url)
+    
+    # Ensure LaunchAgents directory exists
+    LAUNCHD_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(LAUNCHD_PLIST_PATH, "w") as f:
+        f.write(plist_content)
+    
+    console.print(f"[green]✓ Created {LAUNCHD_PLIST_PATH}[/green]")
+    
+    # Load the service
+    import subprocess
+    result = subprocess.run(
+        ["launchctl", "load", str(LAUNCHD_PLIST_PATH)],
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode == 0:
+        console.print("[green]✓ Service installed and loaded[/green]")
+        console.print()
+        console.print("[bold]Next steps:[/bold]")
+        console.print("  • Start service: [cyan]agenticai service start[/cyan]")
+        console.print("  • Check status: [cyan]agenticai service status[/cyan]")
+        console.print("  • View logs: [cyan]tail -f /tmp/agenticai/agenticai.log[/cyan]")
+    else:
+        console.print(f"[red]✗ Failed to load service: {result.stderr}[/red]")
+
+
+@service.command("uninstall")
+@click.pass_context
+def service_uninstall(ctx):
+    """Uninstall the Agentic AI background service."""
+    console.print("[bold]Uninstalling Agentic AI Service[/bold]")
+    
+    if not LAUNCHD_PLIST_PATH.exists():
+        console.print("[yellow]Service not installed.[/yellow]")
+        return
+    
+    import subprocess
+    
+    # Stop and unload the service
+    subprocess.run(["launchctl", "unload", str(LAUNCHD_PLIST_PATH)], capture_output=True)
+    
+    # Remove plist file
+    LAUNCHD_PLIST_PATH.unlink()
+    
+    console.print("[green]✓ Service uninstalled[/green]")
+
+
+@service.command("start")
+@click.pass_context
+def service_start(ctx):
+    """Start the Agentic AI background service."""
+    if not LAUNCHD_PLIST_PATH.exists():
+        console.print("[red]Service not installed. Run 'agenticai service install' first.[/red]")
+        return
+    
+    import subprocess
+    
+    if is_service_running():
+        console.print("[yellow]Service is already running.[/yellow]")
+        return
+    
+    result = subprocess.run(
+        ["launchctl", "start", LAUNCHD_PLIST_NAME],
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode == 0:
+        console.print("[green]✓ Service started[/green]")
+        console.print("[dim]View logs: tail -f /tmp/agenticai/agenticai.log[/dim]")
+    else:
+        console.print(f"[red]✗ Failed to start: {result.stderr}[/red]")
+
+
+@service.command("stop")
+@click.pass_context
+def service_stop(ctx):
+    """Stop the Agentic AI background service."""
+    if not LAUNCHD_PLIST_PATH.exists():
+        console.print("[yellow]Service not installed.[/yellow]")
+        return
+    
+    import subprocess
+    
+    if not is_service_running():
+        console.print("[yellow]Service is not running.[/yellow]")
+        return
+    
+    result = subprocess.run(
+        ["launchctl", "stop", LAUNCHD_PLIST_NAME],
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode == 0:
+        console.print("[green]✓ Service stopped[/green]")
+    else:
+        console.print(f"[red]✗ Failed to stop: {result.stderr}[/red]")
+
+
+@service.command("restart")
+@click.pass_context
+def service_restart(ctx):
+    """Restart the Agentic AI background service."""
+    if not LAUNCHD_PLIST_PATH.exists():
+        console.print("[red]Service not installed. Run 'agenticai service install' first.[/red]")
+        return
+    
+    import subprocess
+    
+    # Stop
+    subprocess.run(["launchctl", "stop", LAUNCHD_PLIST_NAME], capture_output=True)
+    
+    # Start
+    result = subprocess.run(
+        ["launchctl", "start", LAUNCHD_PLIST_NAME],
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode == 0:
+        console.print("[green]✓ Service restarted[/green]")
+    else:
+        console.print(f"[red]✗ Failed to restart: {result.stderr}[/red]")
+
+
+@service.command("status")
+@click.pass_context
+def service_status(ctx):
+    """Check the status of the Agentic AI background service."""
+    console.print(Panel.fit(
+        "[bold]Agentic AI Service Status[/bold]",
+        border_style="blue"
+    ))
+    
+    # Check if installed
+    if not LAUNCHD_PLIST_PATH.exists():
+        console.print("[red]✗ Service not installed[/red]")
+        console.print("[dim]Install with: agenticai service install --webhook-url <url>[/dim]")
+        return
+    
+    console.print(f"[green]✓ Service installed[/green]")
+    console.print(f"  Plist: [dim]{LAUNCHD_PLIST_PATH}[/dim]")
+    
+    # Check if running
+    pid = get_service_pid()
+    if pid:
+        console.print(f"[green]✓ Service running[/green] (PID: {pid})")
+    else:
+        if is_service_running():
+            console.print("[yellow]⚠ Service loaded but not running[/yellow]")
+        else:
+            console.print("[red]✗ Service not running[/red]")
+    
+    # Check logs
+    log_file = LOG_DIR / "agenticai.log"
+    if log_file.exists():
+        console.print(f"\n[bold]Recent logs:[/bold]")
+        try:
+            with open(log_file) as f:
+                lines = f.readlines()[-5:]
+                for line in lines:
+                    console.print(f"  [dim]{line.strip()}[/dim]")
+        except Exception:
+            pass
+    
+    console.print(f"\n[dim]Full logs: tail -f {LOG_DIR}/agenticai.log[/dim]")
+
+
+@service.command("logs")
+@click.option("--follow", "-f", is_flag=True, help="Follow log output")
+@click.option("--lines", "-n", default=50, help="Number of lines to show")
+@click.pass_context
+def service_logs(ctx, follow, lines):
+    """View Agentic AI service logs."""
+    log_file = LOG_DIR / "agenticai.log"
+    
+    if not log_file.exists():
+        console.print("[yellow]No logs found. Service may not have started yet.[/yellow]")
+        return
+    
+    import subprocess
+    
+    if follow:
+        console.print(f"[dim]Following {log_file}... (Ctrl+C to exit)[/dim]")
+        subprocess.run(["tail", "-f", str(log_file)])
+    else:
+        subprocess.run(["tail", "-n", str(lines), str(log_file)])
+
+
+# ============================================================================
+# Tunnel Commands
+# ============================================================================
+
+@cli.group()
+def tunnel():
+    """Manage tunnel for public webhook URL."""
+    pass
+
+
+@tunnel.command("start")
+@click.option("--provider", "-p", default="ngrok", help="Tunnel provider (ngrok or cloudflare)")
+@click.option("--port", default=8080, help="Local port to expose")
+@click.pass_context
+def tunnel_start(ctx, provider, port):
+    """Start a tunnel to expose local server.
+    
+    Uses ngrok by default.
+    
+    Examples:
+        agenticai tunnel start
+        agenticai tunnel start --provider cloudflare
+    """
+    import subprocess
+    import shutil
+    
+    if provider == "cloudflare":
+        # Check if cloudflared is installed
+        if not shutil.which("cloudflared"):
+            console.print("[red]cloudflared not found.[/red]")
+            console.print("\n[bold]Install cloudflared:[/bold]")
+            console.print("  brew install cloudflared  # macOS")
+            console.print("  # or download from https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/")
+            return
+        
+        console.print(Panel.fit(
+            "[bold]Starting Cloudflare Tunnel[/bold]\n\n"
+            f"Exposing: http://localhost:{port}\n"
+            "[dim]Free tunnel with random URL[/dim]",
+            border_style="blue"
+        ))
+        
+        console.print("\n[yellow]Copy the URL that appears and set it as AGENTICAI_WEBHOOK_URL[/yellow]")
+        console.print("[dim]Or use it with: agenticai service install --webhook-url <url>[/dim]\n")
+        
+        # Start cloudflared
+        try:
+            subprocess.run(["cloudflared", "tunnel", "--url", f"http://localhost:{port}"])
+        except KeyboardInterrupt:
+            console.print("\n[dim]Tunnel stopped.[/dim]")
+    
+    elif provider == "ngrok":
+        # Check if ngrok is installed
+        if not shutil.which("ngrok"):
+            console.print("[red]ngrok not found.[/red]")
+            console.print("\n[bold]Install ngrok:[/bold]")
+            console.print("  brew install ngrok  # macOS")
+            console.print("  # or download from https://ngrok.com/download")
+            return
+        
+        console.print(Panel.fit(
+            "[bold]Starting ngrok Tunnel[/bold]\n\n"
+            f"Exposing: http://localhost:{port}",
+            border_style="blue"
+        ))
+        
+        try:
+            subprocess.run(["ngrok", "http", str(port)])
+        except KeyboardInterrupt:
+            console.print("\n[dim]Tunnel stopped.[/dim]")
+    
+    else:
+        console.print(f"[red]Unknown provider: {provider}. Use 'cloudflare' or 'ngrok'.[/red]")
+
+
+@tunnel.command("info")
+@click.pass_context
+def tunnel_info(ctx):
+    """Show tunnel setup information."""
+    console.print(Panel.fit(
+        "[bold]Tunnel Options[/bold]\n\n"
+        "[cyan]1. ngrok (Default)[/cyan]\n"
+        "   • Free tier available\n"
+        "   • Paid plans for fixed URLs\n"
+        "   • Install: brew install ngrok\n"
+        "   • Run: agenticai tunnel start\n\n"
+        "[cyan]2. Cloudflare Tunnel (Free alternative)[/cyan]\n"
+        "   • No account required\n"
+        "   • Free random URL\n"
+        "   • Install: brew install cloudflared\n"
+        "   • Run: agenticai tunnel start --provider cloudflare\n\n"
+        "[bold]After starting tunnel:[/bold]\n"
+        "   1. Copy the public URL shown\n"
+        "   2. Set: export NGROK_URL=<url>\n"
+        "   3. Install service: agenticai service install --webhook-url <url>",
+        border_style="blue"
+    ))
+
+
 def main():
     """Main entry point."""
     cli(obj={})

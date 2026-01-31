@@ -35,3 +35,22 @@ server:
 logging:
   level: "INFO"
   format: "json"
+
+# Tunnel configuration for public webhook URL
+tunnel:
+  enabled: false
+  provider: "ngrok"
+  url: ${NGROK_URL:}  # Set this after tunnel starts, or use fixed URL
+
+# OpenAI Whisper STT - more accurate than Gemini's native STT for proper nouns
+whisper:
+  enabled: false  # Disabled when using OpenAI Realtime (it has built-in Whisper)
+  api_key: ${OPENAI_API_KEY:}
+  model: "whisper-1"
+
+# OpenAI Realtime API - replaces Gemini Live for better transcription
+openai_realtime:
+  enabled: true
+  api_key: ${OPENAI_API_KEY}
+  model: "gpt-4o-realtime-preview-2024-12-17"
+  voice: "alloy"  # Options: alloy, echo, fable, onyx, nova, shimmer

@@ -87,6 +87,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         """TwiML webhook for incoming/outbound calls.
 
         Returns TwiML to connect Media Streams.
+        
+        Handles both:
+        - Outbound calls (we initiated them)
+        - Incoming calls (someone called our Twilio number)
         """
         # Get the base URL for WebSocket connection
         config = get_config()
@@ -101,21 +105,44 @@ def create_app(config: Config | None = None) -> FastAPI:
         call_sid = form_data.get("CallSid", "")
         from_number = form_data.get("From", "")
         to_number = form_data.get("To", "")
+        direction = form_data.get("Direction", "")  # "inbound" or "outbound-api"
 
         logger.info(
             "Voice webhook called",
             call_sid=call_sid,
             from_number=from_number,
             to_number=to_number,
+            direction=direction,
             ws_url=ws_url,
         )
 
-        # Get custom parameters if this call was initiated with them
         call_manager = get_call_manager()
-        call_info = call_manager.get_pending_call_info(call_sid)
-        prompt = call_info.get("prompt", "") if call_info else ""
         
-        logger.info("Call info found", has_call_info=bool(call_info), prompt_length=len(prompt))
+        # Check if this is an outbound call we initiated
+        call_info = call_manager.get_pending_call_info(call_sid)
+        
+        if call_info:
+            # Outbound call - use the prompt we set
+            prompt = call_info.get("prompt", "")
+            logger.info("Outbound call", prompt_length=len(prompt))
+        else:
+            # INCOMING CALL - create a session on-the-fly
+            logger.info("Incoming call detected", from_number=from_number)
+            
+            # Register this as an incoming call
+            call_id = await call_manager.register_incoming_call(
+                call_sid=call_sid,
+                from_number=from_number,
+                to_number=to_number,
+            )
+            
+            # Use a default prompt for incoming calls
+            prompt = config.gemini.system_instruction or (
+                "You are Alchemy, an AI agent created by Istiqlal. "
+                "Be helpful, friendly, and assist the caller with whatever they need. "
+                "You can send messages, search the web, make notes, and more."
+            )
+            logger.info("Created session for incoming call", call_id=call_id)
 
         # Return TwiML with Stream instruction
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -150,18 +177,42 @@ def create_app(config: Config | None = None) -> FastAPI:
     async def api_initiate_call(request: Request):
         """API endpoint to initiate a call.
         
-        This allows external tools to trigger calls through the running server.
+        This allows external tools (like ClawdBot) to trigger calls.
+        
+        Body:
+            {
+                "to": "+1234567890",  # Required: Phone number to call
+                "prompt": "...",       # Optional: Custom prompt
+                "webhook_url": "...",  # Optional: Uses AGENTICAI_WEBHOOK_URL env if not set
+                "metadata": {}         # Optional: Extra metadata
+            }
         """
+        import os
+        
         data = await request.json()
         to_number = data.get("to")
-        prompt = data.get("prompt", "You are a helpful AI assistant making a phone call.")
+        prompt = data.get("prompt")
         webhook_url = data.get("webhook_url")
         metadata = data.get("metadata", {})
+        
+        config = get_config()
 
         if not to_number:
-            return {"error": "Missing 'to' phone number"}
+            return {"success": False, "error": "Missing 'to' phone number"}
+        
+        # Use environment variable if webhook_url not provided
         if not webhook_url:
-            return {"error": "Missing 'webhook_url'"}
+            webhook_url = os.environ.get("AGENTICAI_WEBHOOK_URL") or os.environ.get("NGROK_URL")
+        
+        if not webhook_url:
+            return {
+                "success": False, 
+                "error": "Missing 'webhook_url'. Set AGENTICAI_WEBHOOK_URL environment variable or pass in request."
+            }
+        
+        # Use default prompt if not provided
+        if not prompt:
+            prompt = config.gemini.system_instruction or "You are a helpful AI assistant making a phone call."
 
         call_manager = get_call_manager()
         
@@ -172,10 +223,45 @@ def create_app(config: Config | None = None) -> FastAPI:
                 webhook_base_url=webhook_url,
                 metadata=metadata,
             )
-            return {"success": True, "call_id": call_id}
+            return {
+                "success": True, 
+                "call_id": call_id,
+                "to": to_number,
+                "webhook_url": webhook_url,
+            }
         except Exception as e:
             logger.error("Failed to initiate call", error=str(e))
-            return {"error": str(e)}
+            return {"success": False, "error": str(e)}
+    
+    @app.get("/api/calls")
+    async def api_list_calls():
+        """List active calls."""
+        call_manager = get_call_manager()
+        
+        calls = []
+        for call_id, session in call_manager.active_sessions.items():
+            calls.append({
+                "call_id": call_id,
+                "to_number": session.to_number,
+                "status": session.status,
+                "direction": session.metadata.get("direction", "outbound"),
+            })
+        
+        return {"calls": calls, "count": len(calls)}
+    
+    @app.post("/api/calls/{call_id}/end")
+    async def api_end_call(call_id: str):
+        """End an active call."""
+        call_manager = get_call_manager()
+        
+        if call_id not in call_manager.active_sessions:
+            return {"success": False, "error": "Call not found"}
+        
+        try:
+            await call_manager.end_call(call_id)
+            return {"success": True, "message": f"Call {call_id} ended"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     @app.websocket("/twilio/media-stream")
     async def twilio_media_stream(websocket: WebSocket):

@@ -1,6 +1,9 @@
 # Gemini Live API
 google-genai>=1.0.0
 
+# OpenAI Whisper STT
+openai>=1.0.0
+
 # Twilio REST API
 twilio>=9.0.0
 

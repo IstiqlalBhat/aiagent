@@ -16,6 +16,7 @@ import soxr
 TWILIO_SAMPLE_RATE = 8000
 GEMINI_INPUT_SAMPLE_RATE = 16000
 GEMINI_OUTPUT_SAMPLE_RATE = 24000
+OPENAI_SAMPLE_RATE = 24000  # OpenAI Realtime uses 24kHz for both input and output
 
 # PCM format
 PCM_SAMPLE_WIDTH = 2  # 16-bit = 2 bytes
@@ -87,6 +88,48 @@ class AudioConverter:
 
         # Base64 encode
         return base64.b64encode(mulaw_bytes).decode("ascii")
+
+    def twilio_to_openai(self, twilio_payload: str) -> bytes:
+        """Convert Twilio media payload to OpenAI Realtime format (24kHz PCM).
+
+        Pipeline:
+        1. Base64 decode
+        2. mulaw -> PCM 16-bit
+        3. Resample 8kHz -> 24kHz
+
+        Args:
+            twilio_payload: Base64-encoded mulaw audio from Twilio
+
+        Returns:
+            PCM 16-bit 24kHz audio bytes for OpenAI Realtime
+        """
+        # Decode base64
+        mulaw_bytes = base64.b64decode(twilio_payload)
+
+        # Convert mulaw to PCM 16-bit
+        pcm_8khz = audioop.ulaw2lin(mulaw_bytes, PCM_SAMPLE_WIDTH)
+
+        # Resample 8kHz -> 24kHz
+        pcm_24khz = self._resample(pcm_8khz, TWILIO_SAMPLE_RATE, OPENAI_SAMPLE_RATE)
+
+        return pcm_24khz
+
+    def openai_to_twilio(self, openai_audio: bytes) -> str:
+        """Convert OpenAI Realtime audio to Twilio media payload.
+
+        Pipeline:
+        1. Resample 24kHz -> 8kHz
+        2. PCM 16-bit -> mulaw
+        3. Base64 encode
+
+        Args:
+            openai_audio: PCM 16-bit 24kHz audio from OpenAI
+
+        Returns:
+            Base64-encoded mulaw audio for Twilio
+        """
+        # Same conversion as Gemini (both use 24kHz output)
+        return self.gemini_to_twilio(openai_audio)
 
     def _resample(self, audio_bytes: bytes, from_rate: int, to_rate: int) -> bytes:
         """Resample audio using soxr.

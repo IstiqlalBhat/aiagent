@@ -13,6 +13,7 @@ from .audio_bridge import AudioBridge
 from ..twilio.client import TwilioClient
 from ..twilio.websocket import TwilioMediaStreamHandler
 from ..gemini.realtime_handler import GeminiRealtimeHandler
+from ..openai.realtime_handler import OpenAIRealtimeHandler
 from ..gateway.client import GatewayClient
 from ..gateway.messages import (
     CallStartedMessage,
@@ -185,6 +186,63 @@ class CallManager:
 
         return call_id
 
+    async def register_incoming_call(
+        self,
+        call_sid: str,
+        from_number: str,
+        to_number: str,
+    ) -> str:
+        """Register an incoming call and create a session.
+        
+        Called when someone calls our Twilio number.
+        
+        Args:
+            call_sid: Twilio call SID
+            from_number: Caller's phone number
+            to_number: Our Twilio number
+            
+        Returns:
+            Call ID for the new session
+        """
+        call_id = str(uuid4())
+        
+        logger.info(
+            "Registering incoming call",
+            call_id=call_id,
+            call_sid=call_sid,
+            from_number=from_number,
+        )
+        
+        # Use default prompt for incoming calls
+        prompt = self.config.gemini.system_instruction or (
+            "You are Alchemy, an AI agent created by Istiqlal. "
+            "Be helpful, friendly, and assist the caller with whatever they need."
+        )
+        
+        # Create session for incoming call
+        session = CallSession(
+            call_id=call_id,
+            call_sid=call_sid,
+            to_number=from_number,  # "to" is the caller for incoming
+            prompt=prompt,
+            metadata={"direction": "incoming", "original_to": to_number},
+        )
+        session.status = "ringing"
+        
+        # Store pending call info for media stream handler
+        self._pending_calls[call_sid] = {
+            "call_id": call_id,
+            "prompt": prompt,
+            "metadata": {"direction": "incoming"},
+        }
+        
+        self._active_sessions[call_id] = session
+        
+        # Notify gateway/telegram
+        await self._send_call_started(session)
+        
+        return call_id
+
     def get_pending_call_info(self, call_sid: str) -> dict | None:
         """Get pending call info by call SID.
 
@@ -277,22 +335,21 @@ class CallManager:
             return
 
         print(f"=== Session found: {session.call_id} ===", flush=True)
-        print(f"=== Creating Gemini REALTIME handler with model: {self.config.gemini.model} ===", flush=True)
 
         # Create agent system instruction
-        agent_system_instruction = f"""You are Clawdy, an AI agent assistant on a phone call. You have REAL capabilities to execute commands.
+        agent_system_instruction = f"""You are Alchemy, an AI agent created by Istiqlal. You are on a phone call and have REAL capabilities to execute commands.
 
 IMPORTANT: You are NOT a regular chatbot. You are an AI AGENT with real abilities:
+- You CAN check and send emails
 - You CAN send messages to Telegram, WhatsApp, Discord
-- You CAN make phone calls to other numbers  
 - You CAN search the web and get information
-- You CAN remember things and take notes
-- You CAN execute code and run commands
+- You CAN check your calendar and create events
+- You CAN execute commands on the computer
 
 When the user asks you to do something, SAY "I'll do that now" and then describe what you're doing.
 For example:
-- "Send a message to John" → "I'll send that message to John now via Telegram."
-- "Call my mom" → "I'll call your mom now. What's her number?"
+- "Check my emails" → "I'll check your emails now."
+- "Send a message to John" → "I'll send that message to John now."
 - "Search for restaurants nearby" → "I'm searching for nearby restaurants now..."
 
 User's specific instructions: {session.prompt}
@@ -300,44 +357,63 @@ User's specific instructions: {session.prompt}
 Be helpful, proactive, and ALWAYS act like you can do things. Never say "I cannot" - instead say "I'll do that" or ask for more details if needed.
 """
 
-        # Create Gemini REALTIME handler (improved version)
-        gemini_handler = GeminiRealtimeHandler(
-            api_key=self.config.gemini.api_key,
-            model="models/gemini-2.5-flash-native-audio-preview-12-2025",  # Use working model
-            voice=self.config.gemini.voice,
-            system_instruction=agent_system_instruction,
-        )
-
-        # Connect to Gemini first
-        print("=== CONNECTING TO GEMINI REALTIME ===", flush=True)
-        
         # Create initial greeting prompt
         initial_greeting = (
-            "You are now connected to a phone call as Clawdy, an AI agent. "
+            "You are now connected to a phone call as Alchemy, an AI agent created by Istiqlal. "
             "Greet the caller warmly and let them know you're ready to help with anything - "
-            "sending messages, making calls, searching the web, or any other task."
+            "checking emails, sending messages, searching the web, or any other task."
         )
-        await gemini_handler.connect(initial_prompt=initial_greeting)
-        print("=== GEMINI REALTIME CONNECTED ===", flush=True)
 
-        # Create improved audio bridge with conversation brain
+        # Choose between OpenAI Realtime and Gemini based on config
+        use_openai = self.config.openai_realtime and self.config.openai_realtime.enabled
+        realtime_handler = None
+
+        if use_openai:
+            print(f"=== Creating OpenAI REALTIME handler ===", flush=True)
+            realtime_handler = OpenAIRealtimeHandler(
+                api_key=self.config.openai_realtime.api_key,
+                model=self.config.openai_realtime.model,
+                voice=self.config.openai_realtime.voice,
+                system_instruction=agent_system_instruction,
+            )
+            print("=== CONNECTING TO OPENAI REALTIME ===", flush=True)
+            await realtime_handler.connect(initial_prompt=initial_greeting)
+            print("=== OPENAI REALTIME CONNECTED ===", flush=True)
+        else:
+            print(f"=== Creating Gemini REALTIME handler with model: {self.config.gemini.model} ===", flush=True)
+            realtime_handler = GeminiRealtimeHandler(
+                api_key=self.config.gemini.api_key,
+                model="models/gemini-2.5-flash-native-audio-preview-12-2025",
+                voice=self.config.gemini.voice,
+                system_instruction=agent_system_instruction,
+            )
+            print("=== CONNECTING TO GEMINI REALTIME ===", flush=True)
+            await realtime_handler.connect(initial_prompt=initial_greeting)
+            print("=== GEMINI REALTIME CONNECTED ===", flush=True)
+
+        # Create audio bridge with conversation brain
+        # Note: AudioBridge accepts gemini_handler but works with any handler that has the same interface
         bridge = AudioBridge(
             twilio_handler=twilio_handler,
-            gemini_handler=gemini_handler,
+            gemini_handler=realtime_handler,  # Works with both OpenAI and Gemini handlers
             telegram_client=self._telegram_client,
+            telegram_chat_id=self.config.telegram.chat_id if self.config.telegram else "",
             call_id=session.call_id,
             gemini_api_key=self.config.gemini.api_key,
+            whisper_api_key=self.config.whisper.api_key if self.config.whisper else "",
+            whisper_enabled=self.config.whisper.enabled if self.config.whisper and not use_openai else False,
+            use_openai=use_openai,
         )
 
         session.bridge = bridge
         session.status = "in-progress"
 
-        print("=== STARTING AUDIO BRIDGE V2 ===", flush=True)
+        print("=== STARTING AUDIO BRIDGE ===", flush=True)
 
         try:
             # Start the bridge
             await bridge.start()
-            print("=== AUDIO BRIDGE V2 STARTED ===", flush=True)
+            print("=== AUDIO BRIDGE STARTED ===", flush=True)
 
             # Wait for bridge to complete (stream closed or error)
             while bridge.is_running:
@@ -351,7 +427,7 @@ Be helpful, proactive, and ALWAYS act like you can do things. Never say "I canno
             traceback.print_exc()
         finally:
             await bridge.stop()
-            await gemini_handler.disconnect()
+            await realtime_handler.disconnect()
 
     async def end_call(self, call_id: str) -> None:
         """End an active call.
@@ -422,10 +498,9 @@ Be helpful, proactive, and ALWAYS act like you can do things. Never say "I canno
         )
 
     async def _send_call_started(self, session: CallSession) -> None:
-        """Send call_started message to gateway (Telegram gets transcripts via brain)."""
-        # Simple notification to Telegram (brain handles the conversation)
-        if self._telegram_client:
-            self._telegram_client.send_message(f"📞 *Call started* to {session.to_number}")
+        """Send call_started message to gateway only."""
+        # Note: Don't send to Telegram - only executable commands go there
+        # ClawdBot will receive commands from the ConversationBrain
 
         # Send to gateway (if enabled)
         if self._gateway_client:

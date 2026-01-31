@@ -1,6 +1,9 @@
 """Conversation brain with memory and intent understanding."""
 
 import asyncio
+import subprocess
+import threading
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Awaitable
@@ -84,6 +87,7 @@ class ConversationBrain:
         api_key: str,
         model: str = "gemini-3-flash-preview",  # Latest fast model for intent understanding
         telegram_client = None,
+        telegram_chat_id: str = "",
         call_id: str = "",
     ):
         """Initialize the conversation brain.
@@ -91,12 +95,14 @@ class ConversationBrain:
         Args:
             api_key: Gemini API key
             model: Model for intent understanding
-            telegram_client: Telegram client for sending commands
+            telegram_client: Telegram client (legacy, not used)
+            telegram_chat_id: Telegram chat ID for ClawdBot agent
             call_id: Call identifier
         """
         self.api_key = api_key
         self.model = model
         self.telegram = telegram_client
+        self.telegram_chat_id = telegram_chat_id
         
         self.client = genai.Client(api_key=api_key)
         self.memory = ConversationMemory(call_id=call_id)
@@ -109,145 +115,247 @@ class ConversationBrain:
         
         # Callbacks
         self._on_command: Callable[[str, dict], Awaitable[None]] | None = None
+        self._on_clawdbot_response: Callable[[str], Awaitable[None]] | None = None  # Callback to speak ClawdBot's response
+
+    async def _send_to_clawdbot_async(self, command: str) -> str | None:
+        """Send command to ClawdBot agent and wait for response.
+
+        Args:
+            command: The command to execute
+
+        Returns:
+            ClawdBot's response text, or None if failed
+        """
+        try:
+            if not self.telegram_chat_id:
+                print(f"=== BRAIN ERROR: telegram_chat_id is empty! ===", flush=True)
+                return None
+
+            # Use clawdbot agent WITHOUT --deliver to get response directly
+            # We'll speak the response via Gemini instead of sending to Telegram
+            cmd = [
+                "clawdbot", "agent",
+                "--session-id", "agent:main:main",
+                "--message", command,
+                "--timeout", "90",
+            ]
+            print(f"=== BRAIN: Sending to ClawdBot agent ===", flush=True)
+            print(f"=== BRAIN: Command: {' '.join(cmd)} ===", flush=True)
+
+            # Run async and capture output
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**dict(__import__('os').environ), 'GOG_ACCOUNT': 'istiqlalclemson@gmail.com'},
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=95
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                print(f"=== BRAIN: ClawdBot timeout ===", flush=True)
+                return "I'm still working on that. It's taking longer than expected."
+
+            response_text = stdout.decode('utf-8').strip() if stdout else None
+
+            # Filter out deprecation warnings and extract actual response
+            if response_text:
+                lines = response_text.split('\n')
+                # Skip lines that are warnings or empty
+                clean_lines = [
+                    line for line in lines
+                    if line.strip()
+                    and 'DeprecationWarning' not in line
+                    and not line.startswith('(node:')
+                    and not line.startswith('(Use `node')
+                ]
+                response_text = '\n'.join(clean_lines).strip()
+
+            if response_text:
+                print(f"=== BRAIN: ClawdBot response: {response_text[:300]}... ===", flush=True)
+            else:
+                print(f"=== BRAIN: ClawdBot returned empty response ===", flush=True)
+
+            if stderr:
+                stderr_text = stderr.decode('utf-8')
+                if 'DeprecationWarning' not in stderr_text:
+                    print(f"=== BRAIN: ClawdBot stderr: {stderr_text[:200]} ===", flush=True)
+
+            return response_text
+
+        except Exception as e:
+            print(f"=== BRAIN: ClawdBot error: {e} ===", flush=True)
+            traceback.print_exc()
+            return f"Sorry, I encountered an error: {str(e)}"
     
     def set_callbacks(
         self,
         on_command: Callable[[str, dict], Awaitable[None]] | None = None,
+        on_clawdbot_response: Callable[[str], Awaitable[None]] | None = None,
     ):
-        """Set event callbacks."""
+        """Set event callbacks.
+
+        Args:
+            on_command: Called when a command is detected
+            on_clawdbot_response: Called with ClawdBot's response to speak it
+        """
         self._on_command = on_command
+        self._on_clawdbot_response = on_clawdbot_response
     
     def add_assistant_transcript(self, text: str):
-        """Add assistant transcript fragment (word-by-word)."""
-        self._assistant_buffer.append(text.strip())
+        """Add assistant transcript fragment.
+
+        Gemini sends incremental fragments. We concatenate them directly
+        (no added spaces) - Gemini includes spaces where needed.
+        """
+        if text:
+            self._assistant_buffer.append(text)
     
     def add_user_transcript(self, text: str):
-        """Add user transcript fragment."""
-        self._user_buffer.append(text.strip())
+        """Add user transcript fragment.
+
+        Gemini sends incremental fragments. We concatenate them directly
+        (no added spaces) - Gemini includes spaces where needed.
+        """
+        if text:
+            self._user_buffer.append(text)
+            # Log buffer state
+            current = "".join(self._user_buffer)
+            print(f"=== BRAIN BUFFER: {len(self._user_buffer)} fragments, current: \"{current[:80]}...\" ===", flush=True)
     
     async def flush_assistant_turn(self):
         """Flush buffered assistant transcript as a complete turn."""
         if not self._assistant_buffer:
             return
-        
-        full_text = " ".join(self._assistant_buffer).strip()
+
+        # Concatenate fragments directly (Gemini includes spaces where needed)
+        full_text = "".join(self._assistant_buffer).strip()
         self._assistant_buffer.clear()
         
         if full_text:
             self.memory.add_turn("assistant", full_text)
             print(f"=== BRAIN: Assistant said: {full_text[:100]}... ===", flush=True)
-            
-            # Send Clawdy's response to Telegram
-            if self.telegram:
-                self.telegram.send_message(f"🤖 *Clawdy*: {full_text}")
+            # Note: Don't send Alchemy's responses to Telegram
+            # Only executable commands should go to Telegram for ClawdBot to act on
     
     async def flush_user_turn(self):
         """Flush buffered user transcript as a complete turn and analyze intent."""
         if not self._user_buffer:
             return
-        
-        full_text = " ".join(self._user_buffer).strip()
+
+        # Concatenate fragments directly (Gemini includes spaces where needed)
+        full_text = "".join(self._user_buffer).strip()
+        num_fragments = len(self._user_buffer)
         self._user_buffer.clear()
-        
+
         if not full_text:
+            print(f"=== BRAIN FLUSH: Empty buffer, skipping ===", flush=True)
             return
-        
-        print(f"=== BRAIN: User said: {full_text[:100]}... ===", flush=True)
-        
-        # Analyze intent with Gemini 3
-        intent, command = await self._analyze_intent(full_text)
-        
+
+        print(f"=== BRAIN FLUSH: {num_fragments} fragments → \"{full_text}\" ===", flush=True)
+
+        # Quick check if this looks actionable
+        intent, command, is_actionable = await self._analyze_intent(full_text)
+
         self.memory.add_turn("user", full_text, intent=intent, command=command)
-        
-        # Send user message with intent to Telegram
-        if self.telegram:
-            msg = f"👤 *User*: {full_text}"
-            if intent and intent != "conversation":
-                msg += f"\n📌 Intent: `{intent}`"
-                # If there's a command, include key details
-                if command:
-                    if command.get("message"):
-                        msg += f"\n💬 Message: _{command['message']}_"
-                    if command.get("recipient"):
-                        msg += f"\n📍 To: _{command['recipient']}_"
-            self.telegram.send_message(msg)
-        
+
+        # Send to ClawdBot if actionable and get response
+        if is_actionable:
+            print(f"=== BRAIN: Sending to ClawdBot: \"{full_text}\" ===", flush=True)
+
+            # Get response from ClawdBot
+            response = await self._send_to_clawdbot_async(full_text)
+
+            if response and self._on_clawdbot_response:
+                # Feed response back to Gemini to speak it
+                print(f"=== BRAIN: Feeding response to Gemini to speak ===", flush=True)
+                await self._on_clawdbot_response(response)
+            elif response:
+                print(f"=== BRAIN: Got response but no callback to speak it ===", flush=True)
+        else:
+            print(f"=== BRAIN: Not actionable, skipping ClawdBot ===", flush=True)
+
         # Execute command callback if set
         if command and self._on_command:
             await self._on_command(command.get("action", ""), command)
     
-    async def _analyze_intent(self, user_text: str) -> tuple[str, dict | None]:
-        """Analyze user text to extract intent and command.
-        
+    def _format_executable_command(self, intent: str, command: dict, original_text: str) -> str | None:
+        """Format command for ClawdBot execution.
+
+        ClawdBot has its own LLM, so we just send the natural language request
+        directly without over-processing it.
+
+        Args:
+            intent: The detected intent
+            command: Command details
+            original_text: What the user originally said
+
+        Returns:
+            The original user request for ClawdBot to interpret, or None if not actionable
+        """
+        # Just send the original natural language request to ClawdBot
+        # ClawdBot's LLM will understand and execute it
+        if intent != "conversation":
+            return original_text
+        return None
+    
+    async def _analyze_intent(self, user_text: str) -> tuple[str, dict | None, bool]:
+        """Analyze user text to determine if it's actionable.
+
+        Uses a simple heuristic + LLM check to decide if the request
+        should be forwarded to ClawdBot for execution.
+
         Args:
             user_text: What the user said
-            
+
         Returns:
-            Tuple of (intent, command_dict or None)
+            Tuple of (intent, command_dict or None, is_actionable)
         """
         try:
             context = self.memory.get_recent_context(5)
-            
-            prompt = f"""Analyze this user request and extract the intent.
+
+            # Simple, liberal prompt - let ClawdBot's LLM handle the details
+            prompt = f"""You are a simple intent classifier. Determine if the user wants you to DO something or just chatting.
 
 Recent conversation:
 {context}
 
-User just said: "{user_text}"
+User said: "{user_text}"
 
-Respond with JSON only:
-{{
-  "intent": "one of: send_message, make_call, search_web, set_reminder, take_note, get_info, conversation, unclear",
-  "confidence": 0.0-1.0,
-  "command": {{
-    "action": "the intent",
-    "recipient": "who (if applicable)",
-    "message": "what to send (if applicable)", 
-    "query": "search query (if applicable)",
-    "details": "other relevant details"
-  }} or null if just conversation,
-  "extracted_entities": {{
-    "names": [],
-    "phone_numbers": [],
-    "dates": [],
-    "locations": []
-  }}
-}}"""
+Is this a request to DO something? (open app, search, play music, send message, make call, browse web, take notes, execute command, control device, etc.)
+
+Answer with just ONE word: YES or NO
+
+If the user is asking you to perform ANY action, task, or command - say YES.
+If the user is just chatting, greeting, asking a question about yourself, or having casual conversation - say NO."""
 
             response = self.client.models.generate_content(
                 model=self.model,
                 contents=prompt,
             )
-            
-            # Parse JSON response
-            response_text = response.text.strip()
-            # Remove markdown code blocks if present
-            if response_text.startswith("```"):
-                response_text = response_text.split("```")[1]
-                if response_text.startswith("json"):
-                    response_text = response_text[4:]
-            
-            data = json.loads(response_text)
-            
-            intent = data.get("intent", "conversation")
-            command = data.get("command")
-            
-            # Update extracted info in memory
-            if data.get("extracted_entities"):
-                for key, values in data["extracted_entities"].items():
-                    if values:
-                        if key not in self.memory.extracted_info:
-                            self.memory.extracted_info[key] = []
-                        self.memory.extracted_info[key].extend(values)
-            
-            print(f"=== BRAIN: Intent={intent}, Command={command} ===", flush=True)
-            
-            return intent, command
-            
+
+            answer = response.text.strip().upper()
+            is_actionable = answer.startswith("YES")
+
+            # Simple classification
+            intent = "action" if is_actionable else "conversation"
+
+            # For actionable requests, create a simple command with the original text
+            command = {"original_request": user_text} if is_actionable else None
+
+            print(f"=== BRAIN: Actionable={is_actionable} (LLM said: {answer}) ===", flush=True)
+
+            return intent, command, is_actionable
+
         except Exception as e:
             logger.error("Error analyzing intent", error=str(e))
             print(f"=== BRAIN ERROR: {e} ===", flush=True)
-            return "conversation", None
+            # On error, assume it's actionable to avoid missing commands
+            return "action", {"original_request": user_text}, True
     
     def get_memory_summary(self) -> str:
         """Get a summary of the conversation memory."""
@@ -258,15 +366,12 @@ Respond with JSON only:
         return self.memory.extracted_info
     
     def send_call_summary(self, duration: float):
-        """Send a concise call summary to Telegram.
+        """Log call summary (don't send to Telegram - only executable commands go there).
         
         Args:
             duration: Call duration in seconds
         """
-        if not self.telegram:
-            return
-        
-        # Build concise summary
+        # Build summary for logging only
         commands = []
         for turn in self.memory.turns:
             if turn.command and turn.intent != "conversation":
@@ -278,21 +383,7 @@ Respond with JSON only:
                 commands.append(cmd_summary)
         
         if commands:
-            # There were actionable commands
-            msg = f"📋 *Call Summary* ({duration:.0f}s)\n"
-            msg += "\n".join([f"• `{cmd}`" for cmd in commands])
-            
-            # Add extracted entities if any
-            if self.memory.extracted_info:
-                info_parts = []
-                for key, values in self.memory.extracted_info.items():
-                    if values:
-                        info_parts.append(f"{key}: {', '.join(str(v) for v in values[:3])}")
-                if info_parts:
-                    msg += f"\n\n📎 Extracted: _{', '.join(info_parts)}_"
+            print(f"=== BRAIN: Call ended ({duration:.0f}s) - Commands: {commands} ===", flush=True)
         else:
-            # Just conversation, no commands
-            msg = f"📋 *Call ended* ({duration:.0f}s) - No actionable commands"
-        
-        self.telegram.send_message(msg)
+            print(f"=== BRAIN: Call ended ({duration:.0f}s) - No commands ===", flush=True)
 

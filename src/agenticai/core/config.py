@@ -71,6 +71,31 @@ class LoggingConfig(BaseModel):
     format: str = Field(default="json", description="Log format (json or console)")
 
 
+class TunnelConfig(BaseModel):
+    """Tunnel configuration for public webhook URL."""
+
+    enabled: bool = Field(default=False, description="Enable tunnel auto-start")
+    provider: str = Field(default="cloudflare", description="Tunnel provider (cloudflare or ngrok)")
+    url: str = Field(default="", description="Fixed tunnel URL (if using paid ngrok or custom domain)")
+
+
+class WhisperConfig(BaseModel):
+    """OpenAI Whisper STT configuration."""
+
+    enabled: bool = Field(default=False, description="Enable Whisper for accurate STT")
+    api_key: str = Field(default="", description="OpenAI API key for Whisper")
+    model: str = Field(default="whisper-1", description="Whisper model to use")
+
+
+class OpenAIRealtimeConfig(BaseModel):
+    """OpenAI Realtime API configuration."""
+
+    enabled: bool = Field(default=False, description="Use OpenAI Realtime instead of Gemini")
+    api_key: str = Field(default="", description="OpenAI API key")
+    model: str = Field(default="gpt-4o-realtime-preview-2024-12-17", description="OpenAI Realtime model")
+    voice: str = Field(default="alloy", description="Voice for TTS (alloy, echo, fable, onyx, nova, shimmer)")
+
+
 class Config(BaseModel):
     """Main configuration."""
 
@@ -80,6 +105,9 @@ class Config(BaseModel):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    tunnel: TunnelConfig = Field(default_factory=TunnelConfig)
+    whisper: WhisperConfig = Field(default_factory=WhisperConfig)
+    openai_realtime: OpenAIRealtimeConfig = Field(default_factory=OpenAIRealtimeConfig)
 
 
 def _expand_env_vars(value: Any) -> Any:

@@ -176,6 +176,15 @@ class TwilioMediaStreamHandler:
         payload = media_data.get("payload", "")
 
         if payload and self._on_audio:
+            # Track audio reception
+            if not hasattr(self, '_recv_count'):
+                self._recv_count = 0
+            self._recv_count += 1
+            if self._recv_count == 1:
+                print(f"=== TWILIO: First audio received from phone! ({len(payload)} chars b64) ===", flush=True)
+            elif self._recv_count % 100 == 0:
+                print(f"=== TWILIO: Received {self._recv_count} audio chunks from phone ===", flush=True)
+
             await self._on_audio(payload)
 
     async def _handle_stop(self, data: dict) -> None:
