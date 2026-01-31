@@ -131,12 +131,16 @@ class ConversationBrain:
                 print(f"=== BRAIN ERROR: telegram_chat_id is empty! ===", flush=True)
                 return None
 
+            # Convert literal \n strings to actual newlines (for email composition)
+            # This handles cases where the user says "new line" and it gets transcribed as \n
+            processed_command = command.replace('\\n', '\n')
+
             # Use clawdbot agent WITHOUT --deliver to get response directly
             # We'll speak the response via Gemini instead of sending to Telegram
             cmd = [
                 "clawdbot", "agent",
                 "--session-id", "agent:main:main",
-                "--message", command,
+                "--message", processed_command,
                 "--timeout", "90",
             ]
             print(f"=== BRAIN: Sending to ClawdBot agent ===", flush=True)
@@ -315,6 +319,33 @@ class ConversationBrain:
         Returns:
             Tuple of (intent, command_dict or None, is_actionable)
         """
+        # Quick heuristics to skip LLM call for obvious cases (saves ~300-800ms)
+        text_lower = user_text.lower().strip()
+
+        # Skip LLM for greetings and simple phrases
+        non_actionable_phrases = [
+            "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
+            "how are you", "what's up", "sup", "yo", "thanks", "thank you",
+            "okay", "ok", "alright", "sure", "yes", "no", "yeah", "nope",
+            "bye", "goodbye", "see you", "later", "nevermind", "never mind",
+            "forget it", "forget about it", "nothing", "hmm", "um", "uh",
+        ]
+
+        if text_lower in non_actionable_phrases or len(text_lower) < 3:
+            print(f"=== BRAIN: Quick skip (greeting/short) ===", flush=True)
+            return "conversation", None, False
+
+        # Quick actionable keywords (skip LLM, go straight to ClawdBot)
+        action_keywords = [
+            "open", "play", "search", "find", "send", "call", "text",
+            "check", "show", "get", "set", "turn", "start", "stop",
+            "email", "message", "youtube", "spotify", "browser", "google",
+        ]
+
+        if any(text_lower.startswith(kw) or f" {kw} " in f" {text_lower} " for kw in action_keywords):
+            print(f"=== BRAIN: Quick action keyword detected ===", flush=True)
+            return "action", {"original_request": user_text}, True
+
         try:
             context = self.memory.get_recent_context(5)
 

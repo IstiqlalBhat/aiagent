@@ -73,7 +73,8 @@ class AudioBridge:
         # Audio buffering for better STT (aggregate small chunks)
         self._audio_buffer = bytearray()
         # OpenAI uses 24kHz, Gemini uses 16kHz
-        self._min_chunk_size = 4800 if use_openai else 3200  # ~100ms of audio
+        # Reduced buffer size for lower latency (was 100ms, now 50ms)
+        self._min_chunk_size = 2400 if use_openai else 1600  # ~50ms of audio
 
         # Whisper STT for accurate transcription
         self._whisper: Optional[WhisperSTT] = None
