@@ -4,16 +4,21 @@
 twilio:
   account_sid: ${TWILIO_ACCOUNT_SID}
   auth_token: ${TWILIO_AUTH_TOKEN}
-  from_number: "+1XXXXXXXXXX"
+  from_number: ${TWILIO_PHONE_NUMBER:+1XXXXXXXXXX}
 
 gemini:
   api_key: ${GEMINI_API_KEY}
-  model: "models/gemini-2.5-flash-native-audio-preview-12-2025"
+  model: "models/gemini-2.5-flash-native-audio-latest"
   voice: "Zephyr"
   system_instruction: |
     You are a helpful AI assistant making phone calls on behalf of the user.
     Be concise, professional, and friendly. Listen carefully and respond appropriately.
     When the conversation is complete, summarize any key information or action items.
+
+telegram:
+  enabled: true
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  chat_id: ${TELEGRAM_CHAT_ID}
 
 gateway:
   url: "ws://127.0.0.1:18789"

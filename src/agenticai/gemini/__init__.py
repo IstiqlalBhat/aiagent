@@ -1,5 +1,5 @@
 """Gemini Live API integration."""
 
-from .handler import GeminiLiveHandler
+from .realtime_handler import GeminiRealtimeHandler
 
-__all__ = ["GeminiLiveHandler"]
+__all__ = ["GeminiRealtimeHandler"]

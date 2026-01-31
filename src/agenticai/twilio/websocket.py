@@ -144,6 +144,7 @@ class TwilioMediaStreamHandler:
 
     async def _handle_connected(self, data: dict) -> None:
         """Handle connected event."""
+        print("=== TWILIO STREAM CONNECTED ===", flush=True)
         logger.info("Twilio stream connected", protocol=data.get("protocol"))
         self._is_connected = True
 
@@ -202,6 +203,11 @@ class TwilioMediaStreamHandler:
             payload: Base64-encoded mulaw audio
         """
         if not self._is_connected:
+            print(f"=== TWILIO SEND SKIPPED - not connected! stream_sid={self.metadata.stream_sid} ===", flush=True)
+            return
+
+        if not self.metadata.stream_sid:
+            print(f"=== TWILIO SEND SKIPPED - no stream_sid! ===", flush=True)
             return
 
         message = {
@@ -211,6 +217,15 @@ class TwilioMediaStreamHandler:
         }
 
         await self.websocket.send_text(json.dumps(message))
+        
+        # Log first few sends
+        if not hasattr(self, '_send_count'):
+            self._send_count = 0
+        self._send_count += 1
+        if self._send_count == 1:
+            print(f"=== TWILIO: First audio sent to phone! stream_sid={self.metadata.stream_sid} ===", flush=True)
+        elif self._send_count % 50 == 0:
+            print(f"=== TWILIO: Sent {self._send_count} audio chunks to phone ===", flush=True)
 
     async def send_clear(self) -> None:
         """Clear Twilio's audio buffer (for handling interrupts)."""

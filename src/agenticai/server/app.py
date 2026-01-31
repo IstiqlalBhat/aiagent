@@ -91,10 +91,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         # Get the base URL for WebSocket connection
         config = get_config()
 
-        # Construct WebSocket URL
-        # In production, this should use the public URL
+        # Construct WebSocket URL - use the ngrok URL for public access
         host = request.headers.get("host", f"localhost:{config.server.port}")
-        ws_protocol = "wss" if request.url.scheme == "https" else "ws"
+        ws_protocol = "wss" if "ngrok" in host or request.url.scheme == "https" else "ws"
         ws_url = f"{ws_protocol}://{host}{config.server.websocket_path}"
 
         # Parse form data to get call info
@@ -108,12 +107,15 @@ def create_app(config: Config | None = None) -> FastAPI:
             call_sid=call_sid,
             from_number=from_number,
             to_number=to_number,
+            ws_url=ws_url,
         )
 
         # Get custom parameters if this call was initiated with them
         call_manager = get_call_manager()
         call_info = call_manager.get_pending_call_info(call_sid)
         prompt = call_info.get("prompt", "") if call_info else ""
+        
+        logger.info("Call info found", has_call_info=bool(call_info), prompt_length=len(prompt))
 
         # Return TwiML with Stream instruction
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -126,6 +128,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     </Connect>
 </Response>"""
 
+        logger.info("Returning TwiML", twiml_length=len(twiml))
         return Response(content=twiml, media_type="application/xml")
 
     @app.post("/twilio/status")
@@ -143,21 +146,58 @@ def create_app(config: Config | None = None) -> FastAPI:
 
         return {"status": "ok"}
 
+    @app.post("/api/call")
+    async def api_initiate_call(request: Request):
+        """API endpoint to initiate a call.
+        
+        This allows external tools to trigger calls through the running server.
+        """
+        data = await request.json()
+        to_number = data.get("to")
+        prompt = data.get("prompt", "You are a helpful AI assistant making a phone call.")
+        webhook_url = data.get("webhook_url")
+        metadata = data.get("metadata", {})
+
+        if not to_number:
+            return {"error": "Missing 'to' phone number"}
+        if not webhook_url:
+            return {"error": "Missing 'webhook_url'"}
+
+        call_manager = get_call_manager()
+        
+        try:
+            call_id = await call_manager.initiate_call(
+                to_number=to_number,
+                prompt=prompt,
+                webhook_base_url=webhook_url,
+                metadata=metadata,
+            )
+            return {"success": True, "call_id": call_id}
+        except Exception as e:
+            logger.error("Failed to initiate call", error=str(e))
+            return {"error": str(e)}
+
     @app.websocket("/twilio/media-stream")
     async def twilio_media_stream(websocket: WebSocket):
         """WebSocket endpoint for Twilio Media Streams."""
+        logger.info("WebSocket connection request received")
+        
         handler = TwilioMediaStreamHandler(websocket)
         await handler.accept()
+        logger.info("WebSocket connection accepted")
 
         call_manager = get_call_manager()
 
         try:
             # Process the stream
+            logger.info("Starting media stream handler")
             await call_manager.handle_media_stream(handler)
+            logger.info("Media stream handler completed")
         except Exception as e:
-            logger.error("Error in media stream", error=str(e))
+            logger.error("Error in media stream", error=str(e), exc_info=True)
         finally:
             await handler.close()
+            logger.info("WebSocket connection closed")
 
     return app
 
@@ -175,9 +215,11 @@ def run_server(config: Config | None = None):
 
     app = create_app(config)
 
+    # Disable uvloop due to Python 3.14 recursion bug with task cancellation
     uvicorn.run(
         app,
         host=config.server.host,
         port=config.server.port,
         log_level="info",
+        loop="asyncio",  # Use standard asyncio instead of uvloop
     )

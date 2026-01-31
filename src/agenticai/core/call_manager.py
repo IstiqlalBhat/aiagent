@@ -9,16 +9,16 @@ from uuid import uuid4
 import structlog
 
 from .config import Config
-from .audio_bridge import AudioBridge, TranscriptEntry
+from .audio_bridge import AudioBridge
 from ..twilio.client import TwilioClient
 from ..twilio.websocket import TwilioMediaStreamHandler
-from ..gemini.handler import GeminiLiveHandler
+from ..gemini.realtime_handler import GeminiRealtimeHandler
 from ..gateway.client import GatewayClient
 from ..gateway.messages import (
     CallStartedMessage,
-    TranscriptMessage,
     CallEndedMessage,
 )
+from ..telegram.direct_client import TelegramDirectClient
 
 logger = structlog.get_logger(__name__)
 
@@ -56,6 +56,7 @@ class CallManager:
         self.config = config
         self._twilio_client: TwilioClient | None = None
         self._gateway_client: GatewayClient | None = None
+        self._telegram_client: TelegramDirectClient | None = None
         self._active_sessions: dict[str, CallSession] = {}
         self._pending_calls: dict[str, dict] = {}  # call_sid -> call info
         self._is_running = False
@@ -76,14 +77,25 @@ class CallManager:
             from_number=self.config.twilio.from_number,
         )
 
-        # Initialize and connect gateway client
-        self._gateway_client = GatewayClient(
-            url=self.config.gateway.url,
-            max_reconnect_attempts=self.config.gateway.reconnect_max_attempts,
-            reconnect_base_delay=self.config.gateway.reconnect_base_delay,
-            reconnect_max_delay=self.config.gateway.reconnect_max_delay,
-        )
-        await self._gateway_client.connect()
+        # Initialize Telegram client if enabled
+        if self.config.telegram.enabled:
+            self._telegram_client = TelegramDirectClient(
+                bot_token=self.config.telegram.bot_token,
+                chat_id=self.config.telegram.chat_id,
+            )
+            logger.info("Telegram client initialized", chat_id=self.config.telegram.chat_id)
+
+        # Initialize gateway client (optional, for ClawdBot integration)
+        self._gateway_client = None
+        self._gateway_task = None
+        # Uncomment to enable gateway:
+        # self._gateway_client = GatewayClient(
+        #     url=self.config.gateway.url,
+        #     max_reconnect_attempts=self.config.gateway.reconnect_max_attempts,
+        #     reconnect_base_delay=self.config.gateway.reconnect_base_delay,
+        #     reconnect_max_delay=self.config.gateway.reconnect_max_delay,
+        # )
+        # self._gateway_task = asyncio.create_task(self._gateway_client.connect())
 
         self._is_running = True
         logger.info("Call manager started")
@@ -97,7 +109,14 @@ class CallManager:
         for session in list(self._active_sessions.values()):
             await self._end_session(session)
 
-        # Disconnect gateway
+        # Cancel gateway task and disconnect
+        if hasattr(self, '_gateway_task') and self._gateway_task:
+            self._gateway_task.cancel()
+            try:
+                await self._gateway_task
+            except asyncio.CancelledError:
+                pass
+        
         if self._gateway_client:
             await self._gateway_client.disconnect()
 
@@ -210,82 +229,129 @@ class CallManager:
         Args:
             twilio_handler: Twilio WebSocket handler
         """
-        # Wait for start event to get call info
-        await asyncio.sleep(0.1)  # Brief wait for start event
-
-        # Create a temporary receive loop to get metadata
-        start_received = asyncio.Event()
+        print("=== MEDIA STREAM HANDLER STARTED ===", flush=True)
+        
+        # Wait for start event - get metadata from first few messages
         session: CallSession | None = None
-
-        async def on_start(metadata):
-            nonlocal session
-            call_info = self._pending_calls.get(metadata.call_sid)
-            if call_info:
-                session = self._find_session_by_call_id(call_info["call_id"])
-            start_received.set()
-
-        twilio_handler.set_callbacks(on_start=on_start)
-
-        # Start receiving to get the start event
-        receive_task = asyncio.create_task(twilio_handler.receive_loop())
-
-        try:
-            # Wait for start event with timeout
-            await asyncio.wait_for(start_received.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            logger.error("Timeout waiting for stream start")
-            receive_task.cancel()
-            return
+        received_call_sid = None
+        
+        # Read messages until we get the start event
+        for _ in range(50):  # Max 50 messages to find start
+            try:
+                msg = await asyncio.wait_for(
+                    twilio_handler.websocket.receive_text(),
+                    timeout=2.0
+                )
+                import json
+                data = json.loads(msg)
+                
+                if data.get("event") == "connected":
+                    # Mark handler as connected
+                    twilio_handler._is_connected = True
+                    print("=== TWILIO WEBSOCKET CONNECTED ===", flush=True)
+                    
+                if data.get("event") == "start":
+                    start_data = data.get("start", {})
+                    received_call_sid = start_data.get("callSid", "")
+                    print(f"Got start event, call_sid: {received_call_sid}", flush=True)
+                    
+                    # Set metadata on the handler
+                    twilio_handler.metadata.stream_sid = start_data.get("streamSid", "")
+                    twilio_handler.metadata.call_sid = received_call_sid
+                    twilio_handler._is_connected = True
+                    
+                    call_info = self._pending_calls.get(received_call_sid)
+                    if call_info:
+                        print(f"Found call info: {call_info['call_id']}", flush=True)
+                        session = self._find_session_by_call_id(call_info["call_id"])
+                    break
+                    
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                print(f"Error reading message: {e}", flush=True)
+                break
 
         if not session:
-            logger.error("No session found for media stream")
-            receive_task.cancel()
+            print(f"No session found for call_sid: {received_call_sid}", flush=True)
             return
 
-        # Cancel the temporary receive task
-        receive_task.cancel()
-        try:
-            await receive_task
-        except asyncio.CancelledError:
-            pass
+        print(f"=== Session found: {session.call_id} ===", flush=True)
+        print(f"=== Creating Gemini REALTIME handler with model: {self.config.gemini.model} ===", flush=True)
 
-        # Create Gemini handler
-        gemini_handler = GeminiLiveHandler(
+        # Create agent system instruction
+        agent_system_instruction = f"""You are Clawdy, an AI agent assistant on a phone call. You have REAL capabilities to execute commands.
+
+IMPORTANT: You are NOT a regular chatbot. You are an AI AGENT with real abilities:
+- You CAN send messages to Telegram, WhatsApp, Discord
+- You CAN make phone calls to other numbers  
+- You CAN search the web and get information
+- You CAN remember things and take notes
+- You CAN execute code and run commands
+
+When the user asks you to do something, SAY "I'll do that now" and then describe what you're doing.
+For example:
+- "Send a message to John" → "I'll send that message to John now via Telegram."
+- "Call my mom" → "I'll call your mom now. What's her number?"
+- "Search for restaurants nearby" → "I'm searching for nearby restaurants now..."
+
+User's specific instructions: {session.prompt}
+
+Be helpful, proactive, and ALWAYS act like you can do things. Never say "I cannot" - instead say "I'll do that" or ask for more details if needed.
+"""
+
+        # Create Gemini REALTIME handler (improved version)
+        gemini_handler = GeminiRealtimeHandler(
             api_key=self.config.gemini.api_key,
-            model=self.config.gemini.model,
+            model="models/gemini-2.5-flash-native-audio-preview-12-2025",  # Use working model
             voice=self.config.gemini.voice,
-            system_instruction=self.config.gemini.system_instruction,
+            system_instruction=agent_system_instruction,
         )
 
-        # Create audio bridge
+        # Connect to Gemini first
+        print("=== CONNECTING TO GEMINI REALTIME ===", flush=True)
+        
+        # Create initial greeting prompt
+        initial_greeting = (
+            "You are now connected to a phone call as Clawdy, an AI agent. "
+            "Greet the caller warmly and let them know you're ready to help with anything - "
+            "sending messages, making calls, searching the web, or any other task."
+        )
+        await gemini_handler.connect(initial_prompt=initial_greeting)
+        print("=== GEMINI REALTIME CONNECTED ===", flush=True)
+
+        # Create improved audio bridge with conversation brain
         bridge = AudioBridge(
             twilio_handler=twilio_handler,
             gemini_handler=gemini_handler,
-            initial_prompt=session.prompt,
-        )
-
-        # Set up bridge callbacks
-        bridge.set_callbacks(
-            on_transcript=lambda t: self._handle_transcript(session, t),
+            telegram_client=self._telegram_client,
+            call_id=session.call_id,
+            gemini_api_key=self.config.gemini.api_key,
         )
 
         session.bridge = bridge
         session.status = "in-progress"
 
-        logger.info("Starting audio bridge", call_id=session.call_id)
+        print("=== STARTING AUDIO BRIDGE V2 ===", flush=True)
 
         try:
             # Start the bridge
             await bridge.start()
+            print("=== AUDIO BRIDGE V2 STARTED ===", flush=True)
 
             # Wait for bridge to complete (stream closed or error)
             while bridge.is_running:
                 await asyncio.sleep(0.5)
 
+            print("=== Audio bridge loop ended ===", flush=True)
+
         except Exception as e:
-            logger.error("Error in audio bridge", error=str(e))
+            print(f"=== Error in audio bridge: {e} ===", flush=True)
+            import traceback
+            traceback.print_exc()
         finally:
             await bridge.stop()
+            await gemini_handler.disconnect()
 
     async def end_call(self, call_id: str) -> None:
         """End an active call.
@@ -333,10 +399,10 @@ class CallManager:
         # Calculate duration
         duration = (datetime.now() - session.start_time).total_seconds()
 
-        # Get transcript
+        # Get transcript summary from the brain (with analyzed intents)
         transcript = ""
         if session.bridge:
-            transcript = session.bridge.get_full_transcript()
+            transcript = session.bridge.get_conversation_summary()
 
         # Send call ended to gateway
         await self._send_call_ended(session, duration, transcript)
@@ -356,48 +422,39 @@ class CallManager:
         )
 
     async def _send_call_started(self, session: CallSession) -> None:
-        """Send call_started message to gateway."""
-        if not self._gateway_client:
-            return
+        """Send call_started message to gateway (Telegram gets transcripts via brain)."""
+        # Simple notification to Telegram (brain handles the conversation)
+        if self._telegram_client:
+            self._telegram_client.send_message(f"📞 *Call started* to {session.to_number}")
 
-        message = CallStartedMessage(
-            call_id=session.call_id,
-            to_number=session.to_number,
-            prompt=session.prompt,
-            metadata=session.metadata,
-        )
+        # Send to gateway (if enabled)
+        if self._gateway_client:
+            message = CallStartedMessage(
+                call_id=session.call_id,
+                to_number=session.to_number,
+                prompt=session.prompt,
+                metadata=session.metadata,
+            )
+            await self._gateway_client.send_message(message)
 
-        await self._gateway_client.send_message(message)
-
-    async def _handle_transcript(
-        self, session: CallSession, entry: TranscriptEntry
-    ) -> None:
-        """Handle transcript entry and send to gateway."""
-        if not self._gateway_client:
-            return
-
-        message = TranscriptMessage(
-            call_id=session.call_id,
-            speaker=entry.speaker,
-            text=entry.text,
-            timestamp=entry.timestamp.isoformat(),
-            is_final=entry.is_final,
-        )
-
-        await self._gateway_client.send_message(message)
+    # NOTE: _handle_transcript removed - ConversationBrain now handles all transcripts
+    # Transcripts flow: Gemini -> AudioBridge -> ConversationBrain -> Telegram
+    # The brain buffers word-by-word transcripts and sends complete sentences with intent analysis
 
     async def _send_call_ended(
         self, session: CallSession, duration: float, transcript: str
     ) -> None:
-        """Send call_ended message to gateway."""
-        if not self._gateway_client:
-            return
+        """Send call_ended message to gateway and Telegram summary via brain."""
+        # Send concise summary to Telegram via the brain
+        if session.bridge and session.bridge.brain:
+            session.bridge.brain.send_call_summary(duration)
 
-        message = CallEndedMessage(
-            call_id=session.call_id,
-            duration=duration,
-            outcome=session.status,
-            full_transcript=transcript,
-        )
-
-        await self._gateway_client.send_message(message)
+        # Send to gateway (if enabled)
+        if self._gateway_client:
+            message = CallEndedMessage(
+                call_id=session.call_id,
+                duration=duration,
+                outcome=session.status,
+                full_transcript=transcript,
+            )
+            await self._gateway_client.send_message(message)

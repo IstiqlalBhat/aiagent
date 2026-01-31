@@ -6,8 +6,13 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+
+# Load .env file from current directory or project root
+load_dotenv()
+load_dotenv(Path(__file__).parent.parent.parent.parent / ".env")
 
 
 class TwilioConfig(BaseModel):
@@ -31,6 +36,14 @@ class GeminiConfig(BaseModel):
         default="You are a helpful AI assistant.",
         description="System instruction for Gemini",
     )
+
+
+class TelegramConfig(BaseModel):
+    """Telegram Bot configuration."""
+
+    enabled: bool = Field(default=True, description="Enable Telegram integration")
+    bot_token: str = Field(..., description="Telegram bot token")
+    chat_id: str = Field(..., description="Default Telegram chat ID")
 
 
 class GatewayConfig(BaseModel):
@@ -63,21 +76,29 @@ class Config(BaseModel):
 
     twilio: TwilioConfig
     gemini: GeminiConfig
+    telegram: TelegramConfig
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
 
 def _expand_env_vars(value: Any) -> Any:
-    """Recursively expand environment variables in config values."""
+    """Recursively expand environment variables in config values.
+    
+    Supports:
+        ${VAR_NAME} - expands to env var value or empty string
+        ${VAR_NAME:default} - expands to env var value or default if not set
+    """
     if isinstance(value, str):
-        # Match ${VAR_NAME} pattern
-        pattern = r"\$\{([^}]+)\}"
-        matches = re.findall(pattern, value)
-        for match in matches:
-            env_value = os.environ.get(match, "")
-            value = value.replace(f"${{{match}}}", env_value)
-        return value
+        # Match ${VAR_NAME} or ${VAR_NAME:default} pattern
+        pattern = r"\$\{([^}:]+)(?::([^}]*))?\}"
+        
+        def replace_match(match):
+            var_name = match.group(1)
+            default_value = match.group(2) if match.group(2) is not None else ""
+            return os.environ.get(var_name, default_value)
+        
+        return re.sub(pattern, replace_match, value)
     elif isinstance(value, dict):
         return {k: _expand_env_vars(v) for k, v in value.items()}
     elif isinstance(value, list):
