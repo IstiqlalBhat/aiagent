@@ -1,0 +1,32 @@
+# Agentic AI Configuration
+# Environment variables can be referenced with ${VAR_NAME}
+
+twilio:
+  account_sid: ${TWILIO_ACCOUNT_SID}
+  auth_token: ${TWILIO_AUTH_TOKEN}
+  from_number: "+1XXXXXXXXXX"
+
+gemini:
+  api_key: ${GEMINI_API_KEY}
+  model: "models/gemini-2.5-flash-native-audio-preview-12-2025"
+  voice: "Zephyr"
+  system_instruction: |
+    You are a helpful AI assistant making phone calls on behalf of the user.
+    Be concise, professional, and friendly. Listen carefully and respond appropriately.
+    When the conversation is complete, summarize any key information or action items.
+
+gateway:
+  url: "ws://127.0.0.1:18789"
+  reconnect_max_attempts: 10
+  reconnect_base_delay: 1.0
+  reconnect_max_delay: 60.0
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  webhook_path: "/twilio/voice"
+  websocket_path: "/twilio/media-stream"
+
+logging:
+  level: "INFO"
+  format: "json"

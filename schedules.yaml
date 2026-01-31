@@ -1,0 +1,33 @@
+# Scheduled Calls Configuration
+# Cron format: minute hour day_of_month month day_of_week
+
+schedules:
+  - name: "morning_check"
+    cron: "0 9 * * 1-5"  # 9 AM, Monday-Friday
+    enabled: false
+    calls:
+      - to_number: "+1555123456"
+        prompt: "Good morning check-in call. Ask about any updates or concerns."
+        metadata:
+          purpose: "daily_checkin"
+          priority: "normal"
+
+  - name: "appointment_reminder"
+    cron: "0 8 * * *"  # 8 AM daily
+    enabled: false
+    calls:
+      - to_number: "+1555987654"
+        prompt: "Call to remind about the scheduled appointment today."
+        metadata:
+          purpose: "reminder"
+          priority: "high"
+
+  - name: "weekly_report"
+    cron: "0 17 * * 5"  # 5 PM on Fridays
+    enabled: false
+    calls:
+      - to_number: "+1555111222"
+        prompt: "Weekly status report call. Summarize this week's activities."
+        metadata:
+          purpose: "report"
+          priority: "normal"
