@@ -1,4 +1,4 @@
-# 🤖 Agentic AI - Voice Agent with ClawdBot Integration
+# 🤖 Agentic AI - Voice Agent with OpenClaw Integration
 
 An AI-powered phone call agent that speaks naturally using **OpenAI Realtime API** (with built-in Whisper for accurate transcription), connects via **Twilio**, and integrates with **ClawdBot** for executing commands through the **OpenClaw Gateway**.
 
